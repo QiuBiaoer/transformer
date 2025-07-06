@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from functools import partial
 
 import torch
@@ -76,7 +77,7 @@ class Mlp(nn.Module):
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
+        self.act = act_layer
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop)
 
@@ -96,7 +97,7 @@ class Block(nn.Module):
     # mlp_ratio 计算hidden_features大小 默认为输入4倍   norm_layer正则化层
     # drop_path_ratio 是drop_path的比率，该操作在残差连接之前  drop_ratio 是多头自注意力机制最后的linear后使用的dropout
 
-    def __init__(self, dim, num_heads, mlp_ratio=4, qkv_bias=False, qk_scale=None, drop_ratio=0.,
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_ratio=0.,
                  attn_drop_ratio=0., drop_path_ratio=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super(Block, self).__init__()
         self.norm1 = norm_layer(dim)  # transformer encoder block中的第一个layer norm
@@ -125,7 +126,105 @@ class VisionTransformer(nn.Module):
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim
         self.num_tokens = 2 if distilled else 1
+        # 设置一个较小的参数防止除0
         norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
+        act_layer = act_layer or nn.GELU()
+        self.patch_embed = embed_layer(img_size, patch_size, in_c, embed_dim, norm_layer)
+        num_patches = self.patch_embed.num_patches  # 得到patches的个数
+        # 使用nn.Parameter构建可训练的参数，用零矩阵初始化，第一个为batch，后两个为1*768
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.dist_token = nn.Parameter(torch.zeros(1, 1, embed_dim)) if distilled else None
+        # pos_embed 大小与concat拼接后的大小一致，是197*768
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim))
+        self.pos_drop = nn.Dropout(drop_ratio)
+        # 根据传入的drop_path_ratio 构建等差序列，从0到drop_path_ratio，有depth个元素
+        dpr = [x.item() for x in torch.linspace(0, drop_path_ratio, depth)]
+        # 使用nn.Sequential将列表中的所有模块打包为一个整体 depth对应的是使用了transformer encoder block的数量
+        self.block = nn.Sequential(*[
+            Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                  drop_ratio=drop_ratio, attn_drop_ratio=attn_drop_ratio,drop_path_ratio=dpr[i],
+                  norm_layer=norm_layer, act_layer=act_layer)
+            for i in range(depth)
+        ])
+        self.norm = norm_layer(embed_dim)  # 通过transformer后的layer norm
+        '''
+            这段代码中logits层是作为模型最后一层的原始输出值（一般是全连接层，尚未经过归一化），一般需要通过激活函数得到统计概率作为最终输出
+            这里的representation size指的是你想要的输出数据的尺寸大小  在小规模的ViT中不需要该参数
+        '''
+        if representation_size and not distilled:
+            self.has_logits = True
+            self.num_features = representation_size
+            self.pre_logits = nn.Sequential(OrderedDict([
+                ("fc", nn.Linear(embed_dim, representation_size)),
+                ("act", nn.Tanh())
+            ]))
+        else:
+            self.has_logits = False
+            self.pre_logits = nn.Identity() # 不做任何处理
+        # 分类头
+        self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
+        self.head_dist = None
+        if distilled:
+            self.head_dist = nn.Linear(self.embed_dim, self.num_classes) if num_classes > 0 else nn.Identity()
+        # 权重初始化
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        if self.dist_token is not None:
+            nn.init.trunc_normal_(self.dist_token, std=0.02)
 
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        self.apply(_init_vit_weights)
+
+    def forward_features(self, x):  # 针对patch embedding部分的forward
+        # B C H W -> B num_patches embed_dim  196 * 768
+        x = self.patch_embed(x)
+        # 1, 1, 768 -> B, 1, 768
+        cls_token = self.cls_token.expand(x.shape[0], -1, -1)
+        # dist_token存在， 则拼接dist_token和cls_token, 否则只拼接cls_token和输入的patch特征x
+        if self.dist_token is None:
+            x = torch.cat((cls_token, x), dim=1) # B 197 768
+        else:
+            x = torch.cat((cls_token, self.dist_token.expand(x.shape[0], -1, -1),x), dim=1)
+
+        x = self.pos_drop(x+self.pos_embed)
+        x = self.block(x)
+        x = self.norm(x)
+        if self.dist_token is None:
+            return self.pre_logits(x[:, 0])  # dist_token为None，利用切片的形式获取cls_token对应的输出
+        else:
+            return x[:, 0], x[:, 1:]
+
+    def forward(self, x):
+        x = self.forward_features(x)
+        if self.head_dist is not None:
+            # 知识蒸馏相关知识
+            x, x_dist = self.head(x[0]), self.head_dist(x[1])
+            # 如果是训练模式且不是脚本模式
+            if self.training and not torch.jit.is_scripting():
+                # 则返回两个头部的预测结果
+                return x, x_dist
+        else:
+            x = self.head(x) # 最后的linear全连接层
+        return x
+
+
+def _init_vit_weights(m):
+    # 判断模块m是否为线形层
+    if isinstance(m, nn.Linear):
+        nn.init.trunc_normal_(m.weight, std=0.01)
+        if m.bias is not None: # 如果线性层存在偏置项，则将偏置项初始化为0
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.Conv2d):
+        nn.init.kaiming_normal_(m.weight, mode='fan_out') # 对卷积层的权重做一个初始化，适用于卷积
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.LayerNorm):
+        nn.init.zeros_(m.bias)
+        nn.init.ones_(m.weight)  # 对层归一化的权重初始化为1
+
+
+def vit_base_patch16_224(num_classes:int = 1000, pretrained=False):
+    model = VisionTransformer(img_size=224, patch_size=16, embed_dim=768, depth=12, num_heads=12,
+                              representation_size=None, num_classes=num_classes)
+    return model
 
 
